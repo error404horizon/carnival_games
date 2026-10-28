@@ -37,6 +37,22 @@ p{line-height:1.35;color:#e5d9b5}
 .btn:before{content:"▶ ";color:var(--orange);opacity:0}.btn:hover,.btn:focus-visible{background:#321a15;transform:translateX(3px);outline:1px solid var(--gold)}.btn:hover:before,.btn:focus-visible:before{opacity:1}
 .btn.primary{background:#2b1710;border-color:var(--gold);color:#fff0b3}.btn.secondary{border-color:#5c7161;color:var(--green)}
 .btn.small{display:inline-block;width:auto;min-width:130px;text-align:center}
+.btn.danger{border-color:#7a2a31;color:#ff9aa5;background:#1a0f11}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.booth-tag{display:inline-flex;align-items:center;gap:8px;margin:2px 0 10px;border:1px solid var(--line);padding:6px 10px;color:var(--green);font-size:18px;background:#0b1110d9}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px currentColor;flex:none}
+.dot.off{background:var(--red);box-shadow:0 0 8px var(--red)}
+.panel-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:6px}
+.panel-head h3{margin:0}
+.queue-meta{font-size:17px;color:var(--muted);margin:0 0 4px;min-height:1.3em}
+.queue-flash{font-size:17px;color:var(--green);margin:2px 0 6px;min-height:1.3em}
+.queue-row{display:flex;align-items:center;gap:10px;border:1px solid #26392e;background:#080d0b;padding:9px 10px}
+.queue-row.head{border-color:var(--gold);background:#21130f;box-shadow:0 0 12px #ff762b22}
+.q-pos{font-family:'Press Start 2P',monospace;font-size:9px;color:var(--orange);min-width:22px;text-align:center;flex:none}
+.q-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.q-name small{display:block;font-size:16px;color:var(--muted);margin-top:2px}
+.q-badge{font-family:'Press Start 2P',monospace;font-size:8px;color:var(--gold);white-space:nowrap;flex:none}
+.queue-empty{text-align:center;color:var(--muted);padding:18px;border:1px dashed #2d3b32;line-height:1.5}
 .mode-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .mode{border:1px solid var(--line);padding:16px 10px;background:#101411;color:var(--gold);text-align:center;line-height:1.6}
 .mode strong{display:block;font-family:'Press Start 2P',monospace;font-size:10px;margin:10px 0}
@@ -88,11 +104,40 @@ tr.current td{color:var(--green);background:#112016}
   const COLORS = ['#ff465e','#ff9b38','#ffd166','#7bff9a','#4de8e0'];
   const ICONS = ['🩸','🎃','🌙','👻','🦇'];
   const STORE_KEY = 'hauntotron_leaderboard_v1';
+
+  /*
+   * Booth wiring.
+   *
+   * The arcade talks to the same device API as the ESP32 booths:
+   *   GET  <api> -> { ok, item: { ticket_key, name } | null, pending }
+   *   POST <api> { ticket_key, cancel: true }              remove a player
+   *   POST <api> { ticket_key, result: { game, score, round } }  finish + score
+   *
+   * The key is the booth's device key from magic.booths.api_key. For the
+   * Carnival Games booth the slug is `carnival-games` and the key is GAME88.
+   * Override either value with ?key=...&api=... (handy on a local Supabase) or
+   * from Machine Settings on the device itself.
+   */
+  const params = new URLSearchParams(location.search);
+  const BOOTH = {
+    slug: 'carnival-games',
+    key: (params.get('key') || localStorage.getItem('hauntotron_booth_key') || 'GAME88').trim(),
+    api: (params.get('api') || localStorage.getItem('hauntotron_booth_api') ||
+      'https://gzfpfnrukmsvlfqmdmgn.supabase.co/functions/v1/booth-queue').replace(/\/+$/, '')
+  };
+  for (const field of ['key', 'api']) {
+    const override = params.get(field);
+    if (!override) continue;
+    try { localStorage.setItem('hauntotron_booth_' + field, BOOTH[field]); } catch (e) {}
+  }
+
   let screen = 'home', mode = 'medium', sequence = [], inputIndex = 0, gameType = 'sequence';
   let cardDeck=[], flippedCards=[], matchedCards=[], cardMoves=0, cardLimit=24, replaysLeft=3;
   let score = 0, round = 1, best = 0;
   let accepting = false, busy = false, soundOn = true, soundCtx = null;
   let playerName = localStorage.getItem('hauntotron_name') || '', lastScore = 0, lastRound = 1, lbGame = 'sequence';
+  let boothHead = null, boothPending = 0, queueFlash = '';
+  let activePlayer = null, finishing = false;
 
   const modes = {
     easy:   {label:'BOO BEGINNER', count:3, speed:720, rounds:12, points:10},
@@ -121,26 +166,103 @@ tr.current td{color:var(--green);background:#112016}
   }
   function toneFor(i){playTone([220,277,330,440,554][i]||440,.18,'square',.035);}
   function clickSound(){playTone(180,.04,'square',.018);}
+  function boothReady(){return Boolean(BOOTH.key&&BOOTH.api)}
+  function boothError(data,status){
+    const code=data&&data.error?String(data.error):'http_'+status;
+    if(code==='unauthorized')return 'booth key rejected';
+    if(code==='queue_empty')return 'the queue is empty';
+    if(code==='not_your_turn')return 'that player is no longer at the front';
+    if(code==='result_required')return 'the score was not sent';
+    return code.replace(/_/g,' ');
+  }
   function home(){
     screen='home';
     shell(`<section class="menu-layout">
-      <div class="menu-art"><div class="pixel-art">🎪 🌕 🎃</div><h1>HALLOWEEN<br>CARNIVAL</h1><h2>CARNIVAL GAMES</h2><p class="subtitle">Step right up, if you dare...</p><p>Repeat the lights. Match the cards. Outrun the ghosts.<br>Three games, one midnight midway.</p></div>
-      <div class="panel"><h3>◆ MAIN ATTRACTIONS ◆</h3>
-        <button class="btn primary" data-action="play">START GAME</button>
+      <div class="menu-art"><div class="pixel-art">🎪 🌕 🎃</div><h1>HALLOWEEN<br>CARNIVAL</h1><h2>CARNIVAL GAMES</h2><p class="subtitle">Step right up, if you dare...</p><p>Repeat the lights. Match the cards. Outrun the ghosts.<br>Three games, one midnight midway.</p>
+        <div class="booth-tag"><i class="dot ${boothReady()?'':'off'}"></i> BOOTH ${esc(BOOTH.key)} · ${esc(BOOTH.slug)}</div>
+        <p class="subtitle">Press START to call the next player. Nothing is fetched until you ask.</p></div>
+      <div class="panel"><div class="panel-head"><h3>◆ NEXT PLAYER ◆</h3><span class="queue-meta" id="queue-count">${boothPending?boothPending+' WAITING':''}</span></div>
+        <div class="queue-flash" id="queue-flash">${esc(queueFlash)}</div>
+        <div class="queue-empty" id="booth-message">${boothReady()?'READY · '+esc(BOOTH.key):'NO BOOTH KEY · LOCAL PLAY ONLY'}</div>
+        <button class="btn primary" data-action="booth-start" ${boothReady()?'':'disabled'}>START · CALL NEXT PLAYER</button>
         <button class="btn" data-action="leaderboard">HIGH SCORE BOARD</button>
+        <button class="btn" data-action="play">LOCAL PLAY · NO QUEUE</button>
         <button class="btn" data-action="how">HOW TO PLAY</button>
         <button class="btn" data-action="settings">MACHINE SETTINGS</button>
-        <div style="margin-top:20px;color:var(--muted);font-size:19px">BEST · LIGHTS <strong style="color:var(--green)">${bestOf('sequence')}</strong> · CARDS <strong style="color:var(--green)">${bestOf('cards')}</strong> · RUNNER <strong style="color:var(--green)">${bestOf('runner')}</strong></div>
+        <div style="margin-top:14px;color:var(--muted);font-size:17px">BEST · LIGHTS <strong style="color:var(--green)">${bestOf('sequence')}</strong> · CARDS <strong style="color:var(--green)">${bestOf('cards')}</strong> · RUNNER <strong style="color:var(--green)">${bestOf('runner')}</strong></div>
       </div></section>`);
+  }
+  async function callNextPlayer(){
+    if(!boothReady()){queueFlash='NO BOOTH KEY CONFIGURED';home();return}
+    const start=app.querySelector('[data-action="booth-start"]');
+    const message=document.getElementById('booth-message');
+    if(start){start.disabled=true;start.textContent='CHECKING QUEUE...'}
+    if(message)message.textContent='ASKING THE BOOTH...';
+    try{
+      const res=await fetch(BOOTH.api,{headers:{'x-booth-key':BOOTH.key},cache:'no-store'});
+      const data=await res.json().catch(()=>({}));
+      if(!res.ok||data.ok===false)throw new Error(boothError(data,res.status));
+      boothHead=data.item||null;
+      boothPending=boothHead?Math.max(1,Number(data.pending)||0):0;
+      queueFlash='';
+      if(!boothHead){queueFlash='THE LINE IS EMPTY. NOBODY TO CALL.';boothPending=0;home();return}
+      confirmPlayer();
+    }catch(err){
+      queueFlash='COULD NOT READ THE QUEUE · '+(err instanceof Error?err.message:String(err)).toUpperCase();
+      home();
+    }
+  }
+  function confirmPlayer(){
+    screen='confirm';
+    const name=boothHead?boothHead.name||'CARNIVAL GUEST':'CARNIVAL GUEST';
+    const ticket=boothHead?boothHead.ticket_key||'':'';
+    const behind=Math.max(0,boothPending-1);
+    shell(`<div style="text-align:center"><h2>CALL THE NEXT PLAYER</h2><p class="subtitle">Confirm this is the person standing at the booth.</p>
+      <div class="panel" style="max-width:680px;margin:0 auto;text-align:left">
+        <div class="queue-row head" style="margin-bottom:14px"><span class="q-pos">1</span><span class="q-name" style="font-size:28px">${esc(name)}<small style="font-size:19px">TICKET ${esc(ticket)}</small></span><span class="q-badge">UP NOW</span></div>
+        <div class="stats" style="grid-template-columns:repeat(2,1fr)"><div class="stat"><label>WAITING BEHIND</label><strong>${behind}</strong></div><div class="stat"><label>BOOTH</label><strong>${esc(BOOTH.key)}</strong></div></div>
+        <button class="btn primary" data-action="booth-confirm">CONFIRM · START GAME</button>
+        <button class="btn danger" data-action="booth-cancel">CANCEL · REMOVE PLAYER FROM QUEUE</button>
+      </div></div>`);
+  }
+  function confirmStartPlayer(){
+    if(!boothHead){queueFlash='NOBODY IS WAITING IN LINE';home();return}
+    activePlayer={ticket_key:boothHead.ticket_key,name:boothHead.name||'CARNIVAL GUEST'};
+    playerName=String(activePlayer.name).slice(0,16);
+    try{localStorage.setItem('hauntotron_name',playerName)}catch(e){}
+    queueFlash='';
+    chooseMode();
+  }
+  async function cancelHeadPlayer(){
+    if(!boothHead){home();return}
+    const player=boothHead;
+    boothHead=null;boothPending=0;
+    try{
+      await boothPost({ticket_key:player.ticket_key,cancel:true});
+      queueFlash=`REMOVED ${String(player.name||player.ticket_key).toUpperCase()} FROM THE QUEUE`;
+    }catch(err){
+      queueFlash='COULD NOT REMOVE · '+(err instanceof Error?err.message:String(err)).toUpperCase();
+    }
+    home();
+  }
+  async function boothPost(body){
+    if(!boothReady())throw new Error('booth is not configured');
+    const res=await fetch(BOOTH.api,{method:'POST',headers:{'x-booth-key':BOOTH.key,'content-type':'application/json'},body:JSON.stringify(body)});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok||data.ok===false)throw new Error(boothError(data,res.status));
+    return data;
   }
   function chooseMode(){
     screen='mode';
-    shell(`<h2>CHOOSE YOUR ATTRACTION</h2><p>Playing as <strong style="color:var(--green)">${esc(playerName)}</strong> &nbsp;<button class="btn small secondary" style="min-width:0;padding:2px 10px;margin:0" data-action="play">CHANGE NAME</button></p>
+    const playing=activePlayer
+      ?`<p>NOW PLAYING <strong style="color:var(--green)">${esc(playerName)}</strong> <span style="color:var(--muted)">· TICKET ${esc(activePlayer.ticket_key)}</span></p>`
+      :`<p>Playing as <strong style="color:var(--green)">${esc(playerName)}</strong> &nbsp;<button class="btn small secondary" style="min-width:0;padding:2px 10px;margin:0" data-action="play">CHANGE NAME</button></p>`;
+    shell(`<h2>CHOOSE YOUR ATTRACTION</h2>${playing}
       <div class="mode-grid">
         <button class="mode ${gameType==='sequence'?'selected':''}" data-game="sequence"><span>💡</span><strong>SEQUENCE LIGHTS</strong><span>Repeat the pattern</span></button>
         <button class="mode ${gameType==='cards'?'selected':''}" data-game="cards"><span>🃏</span><strong>CARD MATCH</strong><span>Find every pair</span></button>
         <button class="mode ${gameType==='runner'?'selected':''}" data-game="runner"><span>👻</span><strong>GHOST RUNNER</strong><span>Jump and dodge</span></button>
-      </div><div class="panel" style="margin-top:20px"><p id="mode-desc">${modeDescription()}</p><button class="btn primary" data-action="begin">START SELECTED GAME</button><button class="btn secondary" data-action="home">BACK TO LOBBY</button></div>`);
+      </div><div class="panel" style="margin-top:20px"><p id="mode-desc">${modeDescription()}</p><button class="btn primary" data-action="begin">START SELECTED GAME</button><button class="btn secondary" data-action="${activePlayer?'booth-home':'home'}">${activePlayer?'BACK TO QUEUE':'BACK TO LOBBY'}</button></div>`);
   }
   function modeDescription(){
     const m=modes[mode];
@@ -328,14 +450,54 @@ tr.current td{color:var(--green);background:#112016}
     if(gameType==='cards')finishRun(true,'YOU WIN!','ALL PAIRS FOUND');
     else finishRun(true,'YOU SURVIVED!','MASTER OF THE MIDWAY');
   }
-  function finishRun(won,heading,sub){
+  async function finishRun(won,heading,sub){
+    if(finishing)return;
+    finishing=true;
     screen=won?'victory':'over';lastScore=score;updateBest();
     const rank=saveScore();
     const msg=rank>0?`SCORE SAVED FOR ${esc(playerName)} — RANK #${rank} ON THE ${GAME_NAMES[gameType]} BOARD`:rank===0?`GOOD RUN, ${esc(playerName)} — BUT NOT IN THE TOP 10 THIS TIME`:`NO POINTS THIS TIME, ${esc(playerName)} — TRY AGAIN!`;
+    const player=activePlayer;
+    renderFinish(won,heading,sub,player?'POSTING SCORE TO THE BOOTH...':msg,false,Boolean(player));
+    if(player){
+      try{
+        await boothPost({ticket_key:player.ticket_key,result:{game:gameType,score,round:lastRound,won}});
+        activePlayer=null;
+        boothHead=null;boothPending=0;
+        queueFlash=`SERVED ${String(player.name).toUpperCase()} · ${score} PTS`;
+        renderFinish(won,heading,sub,`SCORE POSTED FOR ${esc(player.name)} — ${score} PTS. THE LINE MOVES ON.`);
+      }catch(err){
+        const detail=err instanceof Error?err.message:String(err);
+        renderFinish(won,heading,sub,`SCORE NOT POSTED · ${esc(detail).toUpperCase()}`,true);
+      }
+    }
+    finishing=false;
+  }
+  function renderFinish(won,heading,sub,msg,failed=false,posting=false){
+    const buttons=posting
+      ?`<button class="btn primary" disabled>POSTING SCORE...</button>`
+      :activePlayer
+        ?`<button class="btn primary" data-action="post-score">RETRY SCORE POST</button><button class="btn secondary" data-action="booth-home">BACK TO QUEUE</button>`
+        :`<button class="btn primary" data-action="${boothReady()?'booth-home':'again'}">${boothReady()?'NEXT PLAYER':(won?'PLAY AGAIN':'TRY AGAIN')}</button><button class="btn secondary" data-action="leaderboard">VIEW LEADERBOARD</button><button class="btn secondary" data-action="choose">CHANGE GAME</button><button class="btn secondary" data-action="home">MAIN LOBBY</button>`;
     shell(`<div style="text-align:center"><div class="pixel-art">${won?'🏆 🎃 🦇':'👻 💀 🎃'}</div><h1${won?'':' style="color:var(--red)"'}>${heading}</h1><h2>${sub}</h2>
       <div class="stats"><div class="stat"><label>FINAL SCORE</label><strong>${score}</strong></div><div class="stat"><label>${LEVEL_LABELS[gameType]}</label><strong>${lastRound}</strong></div><div class="stat"><label>BEST</label><strong>${best}</strong></div><div class="stat"><label>GAME</label><strong>${GAME_NAMES[gameType]}</strong></div></div>
-      <p style="color:var(--green)">${msg}</p>
-      <button class="btn primary" data-action="again">${won?'PLAY AGAIN':'TRY AGAIN'}</button><button class="btn secondary" data-action="leaderboard">VIEW LEADERBOARD</button><button class="btn secondary" data-action="choose">CHANGE GAME</button><button class="btn secondary" data-action="home">MAIN LOBBY</button></div>`);
+      <p id="post-status" style="color:${failed?'var(--red)':'var(--green)'}">${msg}</p>
+      ${buttons}</div>`);
+  }
+  async function retryBoothPost(){
+    if(!activePlayer||finishing)return;
+    const player=activePlayer;
+    const status=document.getElementById('post-status');
+    if(status){status.style.color='var(--green)';status.textContent='POSTING SCORE TO THE BOOTH...'}
+    try{
+      await boothPost({ticket_key:player.ticket_key,result:{game:gameType,score,round:lastRound,won:screen==='victory'}});
+      activePlayer=null;
+      boothHead=null;boothPending=0;
+      queueFlash=`SERVED ${String(player.name).toUpperCase()} · ${score} PTS`;
+      if(status){status.style.color='var(--green)';status.textContent=`SCORE POSTED FOR ${String(player.name).toUpperCase()} — ${score} PTS. THE LINE MOVES ON.`}
+      app.querySelectorAll('[data-action="post-score"]').forEach(b=>b.remove());
+    }catch(err){
+      if(status){status.style.color='var(--red)';status.textContent='SCORE NOT POSTED · '+(err instanceof Error?err.message:String(err)).toUpperCase()}
+    }
   }
   function readScores(){try{return JSON.parse(localStorage.getItem(STORE_KEY)||'[]').filter(r=>r&&r.game!=='numbers')}catch(e){return []}}
   function saveScore(){
@@ -352,16 +514,42 @@ tr.current td{color:var(--green);background:#112016}
     const list=readScores().filter(r=>(r.game||'sequence')===lbGame);
     const rows=list.length?list.map((r,i)=>`<tr><td>${String(i+1).padStart(2,'0')}</td><td>${esc(r.name)}</td><td>${r.score}</td><td>${r.round}</td></tr>`).join(''):`<tr><td colspan="4" style="text-align:center;color:var(--muted)">NO SOULS ON THE BOARD YET. BE THE FIRST!</td></tr>`;
     const tabs=Object.keys(GAME_NAMES).map(k=>`<button class="btn small ${k===lbGame?'primary':'secondary'}" style="margin:0" data-lb="${k}">${GAME_NAMES[k]}</button>`).join('');
-    shell(`<h2>🏆 HIGH SCORE BOARD</h2><p>Legends of the Midnight Midway.</p><div class="formrow">${tabs}</div><div class="table-wrap"><table><thead><tr><th>RANK</th><th>PLAYER</th><th>SCORE</th><th>${LEVEL_LABELS[lbGame]}</th></tr></thead><tbody>${rows}</tbody></table></div>
-      <p style="color:var(--muted);font-size:19px">Scores are saved in this browser on this device. Top 10 per game.</p><button class="btn primary" data-action="play">PLAY FOR A PLACE</button><button class="btn secondary" data-action="home">BACK TO LOBBY</button><button class="btn" data-action="clear-scores">CLEAR LOCAL SCORES</button>`);
+    shell(`<h2>🏆 HIGH SCORE BOARD</h2><p>Legends of the Midnight Midway.</p><div class="formrow">${tabs}</div><div class="table-wrap"><table><thead><tr><th>RANK</th><th>PLAYER</th><th>SCORE</th><th>${LEVEL_LABELS[lbGame]}</th></tr></thead><tbody id="lb-body">${rows}</tbody></table></div>
+      <p id="lb-note" style="color:var(--muted);font-size:19px">${boothReady()?'Loading live booth scores...':'Scores are saved in this browser on this device. Top 10 per game.'}</p><button class="btn primary" data-action="play">PLAY FOR A PLACE</button><button class="btn secondary" data-action="home">BACK TO LOBBY</button><button class="btn" data-action="clear-scores">CLEAR LOCAL SCORES</button>`);
+    void loadBoothLeaderboard(lbGame);
+  }
+  async function loadBoothLeaderboard(game){
+    if(!boothReady())return;
+    try{
+      const res=await fetch(BOOTH.api+'?leaderboard='+encodeURIComponent(game),{cache:'no-store'});
+      const data=await res.json().catch(()=>({}));
+      if(!res.ok||data.ok===false||!Array.isArray(data.leaderboard))throw new Error('leaderboard unavailable');
+      if(screen!=='leaderboard'||lbGame!==game)return;
+      const body=document.getElementById('lb-body');
+      const note=document.getElementById('lb-note');
+      const entries=data.leaderboard
+        .slice()
+        .sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0)||(Number(b.round)||0)-(Number(a.round)||0))
+        .slice(0,10);
+      if(body)body.innerHTML=entries.length?entries.map((r,i)=>`<tr${i===0?' class="current"':''}><td>${String(i+1).padStart(2,'0')}</td><td>${esc(r.player_name||'GUEST')}</td><td>${r.score}</td><td>${r.round}</td></tr>`).join(''):`<tr><td colspan="4" style="text-align:center;color:var(--muted)">NO SCORES POSTED YET. PLAY A GAME!</td></tr>`;
+      if(note)note.textContent=`LIVE BOOTH SCORES · ${BOOTH.slug} · TOP 10`;
+    }catch(err){
+      const note=document.getElementById('lb-note');
+      if(note&&screen==='leaderboard'&&lbGame===game)note.textContent='LIVE BOOTH BOARD OFFLINE · SHOWING THIS DEVICE';
+    }
   }
   function howTo(){
     screen='how';
-    shell(`<h2>HOW TO PLAY</h2><div class="panel"><ol class="help-list"><li>Enter your name first. Every finished run is saved to the leaderboard for you.</li><li>Sequence Lights: watch the lights and repeat their order.</li><li>Card Match: flip two cards and find every matching pair.</li><li>Ghost Runner: jump gravestones (Space / ↑) and duck under bats (↓). On touch screens, use the on-screen buttons or tap to jump.</li><li>In Sequence Lights, a wrong move ends the run. Spooky, but fair.</li><li>Everything plays at Medium difficulty. Try to beat your best score.</li></ol><p style="color:var(--green)">TIP: Say the colors quietly in your head as they flash.</p></div><button class="btn primary" data-action="play">I'M READY</button><button class="btn secondary" data-action="home">BACK TO LOBBY</button>`);
+    shell(`<h2>HOW TO PLAY</h2><div class="panel"><ol class="help-list"><li>Players scan the carnival-games booth QR to join the queue.</li><li>Press START. The booth fetches the player at the front of the line and shows their name and ticket.</li><li>Confirm to start the game. If the person has walked away, press CANCEL to remove them from the queue and call the next player.</li><li>Pick one of the three attractions and play. When the run ends, the score is posted to the booth and the player leaves the queue.</li><li>Sequence Lights: watch the lights and repeat their order.</li><li>Card Match: flip two cards and find every matching pair.</li><li>Ghost Runner: jump gravestones (Space / ↑) and duck under bats (↓). On touch screens, use the on-screen buttons or tap to jump.</li></ol><p style="color:var(--green)">TIP: Say the colors quietly in your head as they flash.</p></div><button class="btn primary" data-action="home">BACK TO QUEUE</button>`);
   }
   function settings(){
     screen='settings';
-    shell(`<h2>MACHINE SETTINGS</h2><div class="panel"><div class="formrow" style="align-items:center"><span style="min-width:150px">SOUND EFFECTS</span><button class="btn small ${soundOn?'primary':'secondary'}" data-action="sound">${soundOn?'ON':'OFF'}</button></div><p style="color:var(--muted);font-size:19px">Your high score and leaderboard are stored locally in this browser.</p></div><button class="btn secondary" data-action="home">SAVE & BACK</button>`);
+    shell(`<h2>MACHINE SETTINGS</h2><div class="panel"><div class="formrow" style="align-items:center"><span style="min-width:150px">SOUND EFFECTS</span><button class="btn small ${soundOn?'primary':'secondary'}" data-action="sound">${soundOn?'ON':'OFF'}</button></div>
+      <h3 style="margin-top:18px">BOOTH CONNECTION</h3>
+      <div class="formrow" style="align-items:center"><span style="min-width:150px">BOOTH KEY</span><strong style="color:var(--green)">${esc(BOOTH.key||'NOT SET')}</strong></div>
+      <div class="formrow" style="align-items:center"><span style="min-width:150px">BOOTH SLUG</span><strong style="color:var(--green)">${esc(BOOTH.slug)}</strong></div>
+      <p style="color:var(--muted);font-size:18px;word-break:break-all">API · ${esc(BOOTH.api)}</p>
+      <p style="color:var(--muted);font-size:18px">To point this device at a local Supabase, open it with <code>?api=http://127.0.0.1:54321/functions/v1/booth-queue&amp;key=GAME88</code>. Your high score table stays in this browser.</p></div><button class="btn secondary" data-action="home">SAVE & BACK</button>`);
   }
   app.addEventListener('click',e=>{
     const lb=e.target.closest('[data-lb]');
@@ -377,16 +565,21 @@ tr.current td{color:var(--green);background:#112016}
     const button=e.target.closest('[data-action]');if(!button)return;
     clickSound();
     switch(button.dataset.action){
-      case 'play':nameScreen();break;
+      case 'play':activePlayer=null;nameScreen();break;
       case 'choose':chooseMode();break;
       case 'begin':beginGame();break;
       case 'runner-restart':beginRunner();break;
-      case 'home':home();break;
+      case 'booth-start':void callNextPlayer();break;
+      case 'booth-confirm':confirmStartPlayer();break;
+      case 'booth-cancel':void cancelHeadPlayer();break;
+      case 'booth-home':activePlayer=null;home();break;
+      case 'post-score':void retryBoothPost();break;
+      case 'home':activePlayer=null;home();break;
       case 'leaderboard':leaderboard();break;
       case 'how':howTo();break;
       case 'settings':settings();break;
       case 'again':beginGame();break;
-      case 'quit':if(confirm('Leave this run? Your current score will not be saved.'))home();break;
+      case 'quit':if(confirm(activePlayer?'Leave this run? The player stays in the queue, and no score will be posted.':'Leave this run? Your current score will not be saved.')){activePlayer=null;home()}break;
       case 'replay':if(!busy&&screen==='game'&&replaysLeft>0){replaysLeft--;accepting=false;busy=true;renderGame('WATCH CLOSELY...');playSequence();}break;
       case 'sound':soundOn=!soundOn;settings();break;
       case 'clear-scores':if(confirm('Clear all leaderboard entries stored in this browser?')){localStorage.removeItem(STORE_KEY);leaderboard(lbGame)}break;
